@@ -88,6 +88,8 @@ def encode_decode(sae: SAE, activations: torch.Tensor) -> dict:
       - l2: mean per-token L2 distance ||x - x_hat||
       - fvu: fraction of variance unexplained (1 - R^2), the standard headline
         reconstruction metric for SAEs
+      - var: the FVU denominator, i.e. the variance of the activation tensor
+        taken as a single scalar over the flattened (num_tokens, d_model) set
       - l0: mean number of active (non-zero) features per token
     """
     sae_param = next(sae.parameters())
@@ -96,12 +98,20 @@ def encode_decode(sae: SAE, activations: torch.Tensor) -> dict:
     feature_acts = sae.encode(acts)
     recon = sae.decode(feature_acts)
 
-    diff = recon - acts
+    # Do the metric math in float32 over the flattened (num_tokens, d_model)
+    # tensor. The model runs in 4-bit, so cast up to avoid dtype noise.
+    d_model = acts.shape[-1]
+    x = acts.reshape(-1, d_model).float()
+    x_hat = recon.reshape(-1, d_model).float()
+    diff = x - x_hat
+
     mse = diff.pow(2).mean()
-    per_token_l2 = diff.flatten(0, -2).norm(dim=-1).mean()
-    # FVU: residual variance over total variance (centred per the whole tensor).
-    total_var = (acts - acts.mean(0, keepdim=True)).pow(2).sum()
-    fvu = diff.pow(2).sum() / total_var.clamp_min(1e-12)
+    per_token_l2 = diff.norm(dim=-1).mean()
+    # FVU = MSE / Var(activations). The denominator is the variance of the whole
+    # activation tensor as a single scalar (unbiased=False) — NOT a per-token or
+    # per-dim variance, which can collapse to ~0 and blow FVU up to ~1e19.
+    var = x.var(unbiased=False)
+    fvu = mse / var
     l0 = (feature_acts != 0).float().flatten(0, -2).sum(-1).mean()
 
     return {
@@ -110,6 +120,7 @@ def encode_decode(sae: SAE, activations: torch.Tensor) -> dict:
         "feature_acts_shape": tuple(feature_acts.shape),
         "mse": mse.item(),
         "l2": per_token_l2.item(),
+        "var": var.item(),
         "fvu": fvu.item(),
         "l0": l0.item(),
     }

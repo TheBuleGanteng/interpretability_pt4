@@ -218,3 +218,6 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 .flash/
+
+# Claude code
+CLAUDE*.md
