@@ -103,6 +103,9 @@ def encode_decode(sae: SAE, activations: torch.Tensor) -> dict:
       - l2: mean per-token L2 distance ||x - x_hat||
       - fvu: fraction of variance unexplained (1 - R^2), the standard headline
         reconstruction metric for SAEs
+      - fvu_denominator: the variance used as the FVU denominator (the same
+        scalar that feeds `fvu = mse / var`); reported so callers can display it
+        without recomputing it
       - l0: mean number of active (non-zero) features per token
     """
     sae_param = next(sae.parameters())
@@ -134,5 +137,6 @@ def encode_decode(sae: SAE, activations: torch.Tensor) -> dict:
         "mse": mse.item(),
         "l2": per_token_l2.item(),
         "fvu": fvu.item(),
+        "fvu_denominator": var.item(),
         "l0": l0.item(),
     }

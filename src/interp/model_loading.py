@@ -1,7 +1,8 @@
 """Model loading helpers.
 
-Loads a Gemma model in 4-bit (via bitsandbytes) and provides a small utility to
-capture the residual stream at a chosen layer using a forward hook.
+Loads a Gemma model at a chosen precision (bf16 / 8-bit / 4-bit via bitsandbytes)
+and provides a small utility to capture the residual stream at a chosen layer
+using a forward hook.
 """
 
 from __future__ import annotations
@@ -13,12 +14,73 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from .config import get_hf_token
 
+# Supported precisions for the compression-gradient experiment.
+PRECISIONS = ("bf16", "8bit", "4bit")
+
 
 @dataclass
 class LoadedModel:
     model: AutoModelForCausalLM
     tokenizer: AutoTokenizer
     name: str
+    precision: str = "4bit"
+
+
+def load_model(
+    model_name: str,
+    precision: str = "4bit",
+    device_map: str = "auto",
+    compute_dtype: torch.dtype = torch.bfloat16,
+) -> LoadedModel:
+    """Load `model_name` at the requested `precision` for inference.
+
+    precision:
+      - "bf16": no quantization; weights in torch.bfloat16 (device_map="cuda").
+      - "8bit": BitsAndBytesConfig(load_in_8bit=True).
+      - "4bit": NF4 (load_in_4bit, double-quant, compute_dtype=bf16) — the
+        original smoke-test path.
+
+    The model precision is the experimental variable; the residual-stream capture
+    and SAE encode/decode downstream are precision-agnostic (they cast to float32
+    for the metric). Uses the HF token from the environment so gated Gemma repos
+    resolve. Returned in eval mode.
+    """
+    if precision not in PRECISIONS:
+        raise ValueError(f"Unknown precision {precision!r}; expected one of {PRECISIONS}")
+
+    token = get_hf_token(required=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, token=token)
+
+    if precision == "bf16":
+        # Uncompressed baseline. Pin to a single CUDA device per the task spec.
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map="cuda",
+            torch_dtype=torch.bfloat16,
+            token=token,
+        )
+    else:
+        if precision == "8bit":
+            quant_config = BitsAndBytesConfig(load_in_8bit=True)
+        else:  # "4bit"
+            quant_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=compute_dtype,
+            )
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=quant_config,
+            device_map=device_map,
+            torch_dtype=compute_dtype,
+            token=token,
+        )
+
+    model.eval()
+    return LoadedModel(
+        model=model, tokenizer=tokenizer, name=model_name, precision=precision
+    )
 
 
 def load_model_4bit(
@@ -26,30 +88,17 @@ def load_model_4bit(
     device_map: str = "auto",
     compute_dtype: torch.dtype = torch.bfloat16,
 ) -> LoadedModel:
-    """Load `model_name` quantised to 4-bit (NF4) for inference.
+    """Load `model_name` quantised to 4-bit (NF4). Thin wrapper over load_model.
 
-    Uses the HF token from the environment (see config.get_hf_token) so gated
-    Gemma repos resolve. The model is returned in eval mode.
+    Preserved for the existing call sites; delegates to load_model with
+    precision="4bit" so the original behavior is unchanged.
     """
-    token = get_hf_token(required=True)
-
-    quant_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=compute_dtype,
-    )
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name, token=token)
-    model = AutoModelForCausalLM.from_pretrained(
+    return load_model(
         model_name,
-        quantization_config=quant_config,
+        precision="4bit",
         device_map=device_map,
-        torch_dtype=compute_dtype,
-        token=token,
+        compute_dtype=compute_dtype,
     )
-    model.eval()
-    return LoadedModel(model=model, tokenizer=tokenizer, name=model_name)
 
 
 def _decoder_layers(model) -> torch.nn.ModuleList:
