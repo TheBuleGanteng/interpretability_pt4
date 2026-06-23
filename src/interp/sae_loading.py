@@ -25,17 +25,24 @@ def sae_id_for_layer(
     layer: int,
     width: str = "16k",
     l0: str = "medium",
+    available_layers: tuple[int, ...] = AVAILABLE_LAYERS,
+    release: str = GEMMA_SCOPE_2_4B_RES_RELEASE,
 ) -> str:
     """Build the SAELens sae_id for a residual SAE at `layer`.
 
     width in {16k, 65k, 262k, 1m}; l0 in {small, medium, big}. These map onto
-    the naming used in the gemma-scope-2-4b-pt-res release, e.g.
+    the naming used in the gemma-scope-2-*-pt-res releases, e.g.
     `layer_17_width_16k_l0_medium`.
+
+    `available_layers` is the registry-verified set of layers that actually have
+    a trained SAE in `release`. This differs per model (4B: 9/17/22/29, 12B:
+    12/24/31/41, 27B: 16/31/40/53) — pass the correct set so a bad layer fails
+    loudly here rather than 404-ing on download.
     """
-    if layer not in AVAILABLE_LAYERS:
+    if layer not in available_layers:
         raise ValueError(
-            f"No residual SAE for layer {layer} in {GEMMA_SCOPE_2_4B_RES_RELEASE}; "
-            f"available layers: {AVAILABLE_LAYERS}"
+            f"No residual SAE for layer {layer} in {release}; "
+            f"available layers: {available_layers}"
         )
     return f"layer_{layer}_width_{width}_l0_{l0}"
 
@@ -54,8 +61,14 @@ def load_residual_sae(
     l0: str = "medium",
     device: str = "cpu",
     dtype: str = "float32",
+    release: str = GEMMA_SCOPE_2_4B_RES_RELEASE,
+    available_layers: tuple[int, ...] = AVAILABLE_LAYERS,
 ) -> LoadedSAE:
-    """Load the Gemma Scope 2 residual SAE matching gemma-3-4b-pt at `layer`.
+    """Load a Gemma Scope 2 residual SAE at `layer` from `release`.
+
+    Defaults target gemma-3-4b-pt. For other model sizes pass the
+    registry-verified `release` (e.g. `gemma-scope-2-12b-pt-res`) and its
+    `available_layers` set so the layer is validated against the right model.
 
     Loads onto `device` (the SAE is small enough to live on CPU even when the
     model is on GPU). Returns the SAE plus its resolved coordinates.
@@ -63,16 +76,18 @@ def load_residual_sae(
     # Ensure the HF token is in the environment for the gated repo download.
     get_hf_token(required=True)
 
-    sae_id = sae_id_for_layer(layer, width=width, l0=l0)
+    sae_id = sae_id_for_layer(
+        layer, width=width, l0=l0, available_layers=available_layers, release=release
+    )
     sae = SAE.from_pretrained(
-        release=GEMMA_SCOPE_2_4B_RES_RELEASE,
+        release=release,
         sae_id=sae_id,
         device=device,
         dtype=dtype,
     )
     return LoadedSAE(
         sae=sae,
-        release=GEMMA_SCOPE_2_4B_RES_RELEASE,
+        release=release,
         sae_id=sae_id,
         layer=layer,
     )
@@ -88,8 +103,6 @@ def encode_decode(sae: SAE, activations: torch.Tensor) -> dict:
       - l2: mean per-token L2 distance ||x - x_hat||
       - fvu: fraction of variance unexplained (1 - R^2), the standard headline
         reconstruction metric for SAEs
-      - var: the FVU denominator, i.e. the variance of the activation tensor
-        taken as a single scalar over the flattened (num_tokens, d_model) set
       - l0: mean number of active (non-zero) features per token
     """
     sae_param = next(sae.parameters())
@@ -120,7 +133,6 @@ def encode_decode(sae: SAE, activations: torch.Tensor) -> dict:
         "feature_acts_shape": tuple(feature_acts.shape),
         "mse": mse.item(),
         "l2": per_token_l2.item(),
-        "var": var.item(),
         "fvu": fvu.item(),
         "l0": l0.item(),
     }
