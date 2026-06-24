@@ -195,7 +195,9 @@ def capture_resid_from_input_ids(
         input_ids = input_ids.to(loaded.model.device)
         # All sequences are exactly seq_len (the stream is packed, not padded),
         # so a default full-attention mask is correct — no attention_mask needed.
-        loaded.model(input_ids=input_ids)
+        # use_cache=False: we only need the layer's hidden state via the hook, so
+        # skip allocating a past_key_values KV-cache for every chunk.
+        loaded.model(input_ids=input_ids, use_cache=False)
     finally:
         handle.remove()
 

@@ -57,18 +57,43 @@ from interp.noise_floor import measure_perturbation  # noqa: E402
 from interp.sae_loading import encode_decode_sums, load_residual_sae  # noqa: E402
 
 
+_TRUE_STRINGS = ("1", "true", "yes", "on")
+_FALSE_STRINGS = ("0", "false", "no", "off")
+
+
 def _env_bool(name: str, default: bool) -> bool:
-    """Read a boolean from the environment (1/true/yes/on), else `default`."""
+    """Read a boolean from the environment, else `default`.
+
+    Accepts only explicit truthy/falsey spellings (case-insensitive); an
+    unrecognized value fails fast rather than silently being treated as False.
+    """
     raw = os.environ.get(name)
-    if raw is None:
+    if raw is None or not raw.strip():
         return default
-    return raw.strip().lower() in ("1", "true", "yes", "on")
+    value = raw.strip().lower()
+    if value in _TRUE_STRINGS:
+        return True
+    if value in _FALSE_STRINGS:
+        return False
+    raise ValueError(
+        f"Invalid boolean for {name}={raw!r}; expected one of "
+        f"{_TRUE_STRINGS + _FALSE_STRINGS}"
+    )
 
 
 def _env_int(name: str, default: int) -> int:
-    """Read an int from the environment, else `default`."""
+    """Read an int from the environment, else `default`.
+
+    A non-integer value fails fast with a message naming the variable, rather
+    than surfacing a bare `int()` ValueError.
+    """
     raw = os.environ.get(name)
-    return int(raw) if raw is not None and raw.strip() else default
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        raise ValueError(f"Invalid integer for {name}={raw!r}") from None
 
 
 # --- Measurement toggles (set in the first Colab cell, or via env var) -----
@@ -117,9 +142,27 @@ CHUNK_LEN = 512
 BATCH_SIZE = 4
 
 
+def _headline_target() -> int:
+    """Token count the HEADLINE metrics are reported at.
+
+    This is N_TOKENS, capped to the MAX_TOKENS budget: if the configured headline
+    exceeds the budget, the most we can stream is MAX_TOKENS, so that becomes the
+    headline. Always a reachable, positive target.
+    """
+    return min(N_TOKENS, MAX_TOKENS)
+
+
 def _active_checkpoints() -> list[int]:
-    """Sorted stability checkpoints that fit within the MAX_TOKENS budget."""
-    return [c for c in sorted(STABILITY_CHECKPOINTS) if c <= MAX_TOKENS]
+    """Sorted stability checkpoints within the MAX_TOKENS budget.
+
+    Always includes the headline target (see `_headline_target`) so the headline
+    snapshot is recorded even when N_TOKENS is not one of the fixed
+    STABILITY_CHECKPOINTS or the budget is smaller than the smallest checkpoint.
+    Guaranteed non-empty.
+    """
+    pts = {c for c in STABILITY_CHECKPOINTS if c <= MAX_TOKENS}
+    pts.add(_headline_target())
+    return sorted(pts)
 
 # Bit-width is the second experimental axis: bf16 (uncompressed) -> 8bit -> 4bit.
 # Columns in the summary tables are always shown in this order, regardless of the
@@ -174,7 +217,7 @@ def _metrics_from_sums(acc: dict) -> dict:
     }
 
 
-def run_condition(loaded_sae, name: str, precision: str, layer: int, dataset) -> dict | None:
+def run_condition(loaded_sae, name: str, precision: str, layer: int, dataset) -> dict | str:
     """Run one (model x bit-width) condition over the streamed corpus.
 
     Loads `name` at `precision`, then streams the Pile `dataset` packed into
@@ -190,10 +233,11 @@ def run_condition(loaded_sae, name: str, precision: str, layer: int, dataset) ->
 
     Snapshots FVU/L0/MSE at each STABILITY_CHECKPOINTS token count (those within
     the MAX_TOKENS budget) so the metric can be watched stabilizing; processes up
-    to the largest such checkpoint. Returns the HEADLINE metrics (at N_TOKENS)
-    plus a `stability` list of per-checkpoint snapshots, or None on a d_in
-    mismatch. The model is always freed in the finally block; OOM/other
-    exceptions propagate after cleanup.
+    to the largest such checkpoint. On success returns the HEADLINE metrics dict
+    (at N_TOKENS) plus a `stability` list of per-checkpoint snapshots. On a
+    non-fatal skip returns a distinct STATUS STRING instead: "MISMATCH" (model
+    d_model != SAE d_in) or "NO-DATA" (the stream yielded no tokens). The model is
+    always freed in the finally block; OOM/other exceptions propagate after cleanup.
     """
     loaded = None
     try:
@@ -247,7 +291,7 @@ def run_condition(loaded_sae, name: str, precision: str, layer: int, dataset) ->
                         f"Skipping {name} @ {precision}."
                     )
                     del acts
-                    return None
+                    return "MISMATCH"
                 verified = True
 
             # Accumulate this chunk's sums, then FREE the activation chunk — the
@@ -272,20 +316,24 @@ def run_condition(loaded_sae, name: str, precision: str, layer: int, dataset) ->
 
         if acc["n_tokens"] == 0:
             print(f"  [!] No tokens streamed for {name} @ {precision}.")
-            return None
+            return "NO-DATA"
 
-        # If the stream ran dry before some checkpoints, record them at whatever
-        # was reached so the headline still resolves (won't happen for pile-10k).
-        while next_ckpt < len(checkpoints):
-            snap = _metrics_from_sums(acc)
-            snap["target"] = checkpoints[next_ckpt]
-            snapshots.append(snap)
-            next_ckpt += 1
-
-        # Headline = the snapshot at N_TOKENS (the configured sample size).
+        # Headline = the snapshot at the headline target (N_TOKENS capped to the
+        # budget). It is one of `checkpoints`, so it is normally recorded during
+        # the loop above. If the stream ran dry before reaching it, fall back to
+        # the metrics at the most tokens we actually got — never assume a snapshot
+        # exists (snapshots can be empty for a tiny budget / short stream).
+        headline_target = _headline_target()
         headline = next(
-            (s for s in snapshots if s["target"] == N_TOKENS), snapshots[-1]
+            (s for s in snapshots if s["target"] == headline_target), None
         )
+        if headline is None:
+            headline = _metrics_from_sums(acc)
+            headline["target"] = headline_target
+            print(
+                f"  [!] Stream reached only {acc['n_tokens']} tokens "
+                f"(< headline target {headline_target}); reporting at that count."
+            )
         print(f"  --- headline @ {headline['tokens']} tokens ---")
         print(f"  tokens evaluated:           {headline['tokens']}")
         print(f"  reconstruction MSE:         {headline['mse']:.6f}")
@@ -318,7 +366,29 @@ def _is_oom(exc: Exception) -> bool:
     return isinstance(exc, oom_type) or "out of memory" in str(exc).lower()
 
 
+def _validate_config() -> None:
+    """Reject token-budget settings that would silently produce misleading runs.
+
+    N_TOKENS / MAX_TOKENS are user-configurable (env or top-of-file); a zero or
+    negative value must fail fast with a clear message rather than yield a
+    no-token or empty-checkpoint result. CHUNK_LEN / BATCH_SIZE must be positive
+    so each forward actually carries tokens.
+    """
+    problems = []
+    if N_TOKENS <= 0:
+        problems.append(f"N_TOKENS must be > 0 (got {N_TOKENS})")
+    if MAX_TOKENS <= 0:
+        problems.append(f"MAX_TOKENS must be > 0 (got {MAX_TOKENS})")
+    if CHUNK_LEN <= 0:
+        problems.append(f"CHUNK_LEN must be > 0 (got {CHUNK_LEN})")
+    if BATCH_SIZE <= 0:
+        problems.append(f"BATCH_SIZE must be > 0 (got {BATCH_SIZE})")
+    if problems:
+        raise ValueError("Invalid token-budget configuration: " + "; ".join(problems))
+
+
 def main() -> None:
+    _validate_config()
     print("=" * 70)
     print("Compression-gradient experiment: SAE reconstruction vs bit-width")
     print(f"  models:    {', '.join(m['model_name'] for m in MODEL_CONFIGS)}")
@@ -416,8 +486,11 @@ def main() -> None:
                 for precision in model_cfg["run_bitwidths"]:
                     print(f"\n--- [SAE] {name} @ {precision} ---")
                     try:
-                        metrics = run_condition(loaded_sae, name, precision, layer, dataset)
-                        results[name][precision] = metrics if metrics is not None else "MISMATCH"
+                        # run_condition returns a metrics dict on success, or a
+                        # distinct status string ("MISMATCH" / "NO-DATA") on skip.
+                        results[name][precision] = run_condition(
+                            loaded_sae, name, precision, layer, dataset
+                        )
                     except Exception as exc:  # noqa: BLE001 — keep the matrix alive
                         if _is_oom(exc):
                             print(f"\n  SKIPPED (out of memory): {name} @ {precision}")
@@ -484,9 +557,12 @@ def _run_noise_floor(loaded_sae, name: str, layer: int, dataset, out: dict) -> N
                 test_model = load_model(
                     name, precision=precision, compute_dtype=torch.bfloat16
                 )
+                # Use the SAME effective budget as the SAE headline (N_TOKENS
+                # capped to MAX_TOKENS) so both measurements cover identical
+                # tokens and a capped run stays cheap.
                 metrics = measure_perturbation(
                     loaded_sae, ref_model, test_model, dataset, layer,
-                    CHUNK_LEN, BATCH_SIZE, N_TOKENS,
+                    CHUNK_LEN, BATCH_SIZE, _headline_target(),
                 )
                 out[precision] = metrics
                 print(
