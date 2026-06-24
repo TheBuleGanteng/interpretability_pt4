@@ -140,3 +140,61 @@ def encode_decode(sae: SAE, activations: torch.Tensor) -> dict:
         "fvu_denominator": var.item(),
         "l0": l0.item(),
     }
+
+
+@torch.no_grad()
+def encode_decode_sums(sae: SAE, activations: torch.Tensor) -> dict:
+    """Per-chunk reconstruction SUMS for incremental FVU / MSE / L0 accumulation.
+
+    This is the chunked sibling of `encode_decode`. Whole-corpus activations
+    (tens of thousands of tokens at d_model up to 3840) do not fit in memory, so
+    the driver streams them in chunks and must accumulate metrics ACROSS chunks.
+    FVU is a ratio of sums, and you cannot average per-chunk FVUs — averaging
+    ratios is wrong. So this returns the UNREDUCED sums; the driver accumulates
+    them and divides ONCE at the end:
+
+        fvu              = sse / var_sum           (identical to encode_decode's mse/var)
+        mse              = sse / n_elements
+        l0               = active_sum / n_tokens
+        fvu_denominator  = var_sum = sum_x2 - sum_x**2 / n_elements
+
+    `var_sum` is the total squared deviation of every activation element from the
+    GLOBAL scalar mean over ALL elements — the streaming-stable identity
+    sum((x-mu)^2) = sum(x^2) - (sum x)^2 / N, which matches x.var(unbiased=False)
+    in encode_decode once divided by N. Concatenating every chunk and calling
+    encode_decode once yields the SAME fvu / mse / l0 as accumulating these sums.
+
+    Sums are reduced in float64 so var_sum stays stable across the hundreds of
+    millions of elements a full run accumulates. No tensors are returned — the
+    reconstruction is discarded here so the caller can free the chunk promptly.
+    """
+    sae_param = next(sae.parameters())
+    acts = activations.to(device=sae_param.device, dtype=sae_param.dtype)
+
+    feature_acts = sae.encode(acts)
+    recon = sae.decode(feature_acts)
+
+    # Match encode_decode exactly: flatten to (num_tokens, d_model) and do the
+    # metric math in float32, then reduce the scalar sums in float64.
+    d_model = acts.shape[-1]
+    x = acts.reshape(-1, d_model).float()
+    x_hat = recon.reshape(-1, d_model).float()
+    diff = x - x_hat
+
+    sse = diff.pow(2).double().sum().item()
+    sum_x = x.double().sum().item()
+    sum_x2 = x.double().pow(2).sum().item()
+    n_elements = x.shape[0] * x.shape[1]
+    n_tokens = x.shape[0]
+    active_sum = (
+        (feature_acts != 0).float().flatten(0, -2).sum(-1).double().sum().item()
+    )
+
+    return {
+        "sse": sse,
+        "sum_x": sum_x,
+        "sum_x2": sum_x2,
+        "n_elements": n_elements,
+        "n_tokens": n_tokens,
+        "active_sum": active_sum,
+    }

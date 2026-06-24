@@ -160,3 +160,43 @@ def capture_residual_stream(
         "d_model": acts.shape[-1],
     }
     return acts, info
+
+
+@torch.no_grad()
+def capture_resid_from_input_ids(
+    loaded: LoadedModel,
+    input_ids: torch.Tensor,
+    layer: int,
+) -> torch.Tensor:
+    """Capture the residual stream at `layer` for a batch of pre-tokenized ids.
+
+    Same capture point as `capture_residual_stream` (the *output* hidden state of
+    decoder block `layer`), but takes a ready-made [batch, seq_len] LongTensor of
+    token ids instead of raw text. This is the chunked-streaming entry point: the
+    driver packs a Pile token stream into fixed-length sequences and feeds them
+    here one batch at a time, so tens of thousands of tokens never have to be
+    tokenized — or held in memory — all at once.
+
+    Returns the activations tensor [batch, seq_len, d_model]; the caller is
+    responsible for freeing it after accumulating its metrics.
+    """
+    layers = _decoder_layers(loaded.model)
+    if not (0 <= layer < len(layers)):
+        raise IndexError(f"layer {layer} out of range (model has {len(layers)} layers)")
+
+    captured: dict[str, torch.Tensor] = {}
+
+    def hook(_module, _inputs, output):
+        hidden = output[0] if isinstance(output, tuple) else output
+        captured["resid"] = hidden.detach()
+
+    handle = layers[layer].register_forward_hook(hook)
+    try:
+        input_ids = input_ids.to(loaded.model.device)
+        # All sequences are exactly seq_len (the stream is packed, not padded),
+        # so a default full-attention mask is correct — no attention_mask needed.
+        loaded.model(input_ids=input_ids)
+    finally:
+        handle.remove()
+
+    return captured["resid"]
