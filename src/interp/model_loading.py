@@ -167,7 +167,8 @@ def capture_resid_from_input_ids(
     loaded: LoadedModel,
     input_ids: torch.Tensor,
     layer: int,
-) -> torch.Tensor:
+    return_logits: bool = False,
+):
     """Capture the residual stream at `layer` for a batch of pre-tokenized ids.
 
     Same capture point as `capture_residual_stream` (the *output* hidden state of
@@ -177,8 +178,12 @@ def capture_resid_from_input_ids(
     here one batch at a time, so tens of thousands of tokens never have to be
     tokenized — or held in memory — all at once.
 
-    Returns the activations tensor [batch, seq_len, d_model]; the caller is
-    responsible for freeing it after accumulating its metrics.
+    By default returns just the activations tensor [batch, seq_len, d_model].
+    When `return_logits` is True, returns (activations, logits) where `logits` is
+    the model's [batch, seq_len, vocab] output from the SAME forward pass — so the
+    cross-entropy / performance measurement reuses this forward rather than running
+    a second one. The caller is responsible for freeing both tensors after
+    accumulating their metrics.
     """
     layers = _decoder_layers(loaded.model)
     if not (0 <= layer < len(layers)):
@@ -197,8 +202,11 @@ def capture_resid_from_input_ids(
         # so a default full-attention mask is correct — no attention_mask needed.
         # use_cache=False: we only need the layer's hidden state via the hook, so
         # skip allocating a past_key_values KV-cache for every chunk.
-        loaded.model(input_ids=input_ids, use_cache=False)
+        out = loaded.model(input_ids=input_ids, use_cache=False)
     finally:
         handle.remove()
 
-    return captured["resid"]
+    acts = captured["resid"]
+    if return_logits:
+        return acts, out.logits.detach()
+    return acts

@@ -221,3 +221,6 @@ __marimo__/
 
 # Claude code
 CLAUDE*.md
+
+# Experiment run artifacts (generated on GPU; reload via results/latest.json)
+results/

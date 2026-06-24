@@ -44,6 +44,7 @@ from __future__ import annotations
 import gc
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # Make `src/` importable without installing the package.
@@ -54,6 +55,8 @@ import torch  # noqa: E402
 from interp.corpus import iter_token_batches, load_pile_stream  # noqa: E402
 from interp.model_loading import capture_resid_from_input_ids, load_model  # noqa: E402
 from interp.noise_floor import measure_perturbation  # noqa: E402
+from interp.performance import cross_entropy_sums, finalize_cross_entropy  # noqa: E402
+from interp.results_io import build_results_document, write_results  # noqa: E402
 from interp.sae_loading import encode_decode_sums, load_residual_sae  # noqa: E402
 
 
@@ -101,6 +104,10 @@ def _env_int(name: str, default: int) -> int:
 # is exactly the original FVU path: no extra compute, no bf16-reference passes.
 MEASURE_SAE = _env_bool("MEASURE_SAE", True)
 MEASURE_NOISE_FLOOR = _env_bool("MEASURE_NOISE_FLOOR", True)
+# Model-performance proxy: next-token cross-entropy / perplexity of each
+# (model x bit-width) on the SAME streamed tokens. Reuses the activation-capture
+# forward pass (no separate forward) and runs INDEPENDENTLY of MEASURE_SAE.
+MEASURE_MODEL_PERFORMANCE = _env_bool("MEASURE_MODEL_PERFORMANCE", True)
 # MEASURE_BEHAVIOR — reserved for a future task; not implemented here.
 
 # Keep SAE width/l0 fixed across models so the FVU/L0 numbers are comparable.
@@ -217,27 +224,95 @@ def _metrics_from_sums(acc: dict) -> dict:
     }
 
 
-def run_condition(loaded_sae, name: str, precision: str, layer: int, dataset) -> dict | str:
+def _finalize_sae_result(
+    measure_sae: bool, sae_status, snapshots: list, acc: dict,
+    headline_target: int, name: str, precision: str,
+):
+    """Reduce the SAE accumulators into the headline result (or a status string)."""
+    if not measure_sae:
+        return None
+    if sae_status is not None:  # e.g. "MISMATCH"
+        return sae_status
+    if acc["n_tokens"] == 0:
+        print(f"  [!] No SAE tokens streamed for {name} @ {precision}.")
+        return "NO-DATA"
+
+    # Headline = the snapshot at the headline target (it is one of the
+    # checkpoints, so normally recorded during the loop). Fall back to the metrics
+    # at the most tokens we got if the stream ran dry — never assume a snapshot.
+    headline = next((s for s in snapshots if s["target"] == headline_target), None)
+    if headline is None:
+        headline = _metrics_from_sums(acc)
+        headline["target"] = headline_target
+        print(f"  [!] SAE stream reached only {acc['n_tokens']} tokens "
+              f"(< headline {headline_target}); reporting at that count.")
+    print(f"  --- SAE headline @ {headline['tokens']} tokens ---")
+    print(f"  reconstruction MSE:         {headline['mse']:.6f}")
+    print(f"  FVU denominator (var sum):  {headline['fvu_denominator']:.4f}")
+    print(f"  FVU (1 - R^2):              {headline['fvu']:.4f}")
+    print(f"  mean L0 (active feats):     {headline['l0']:.1f}")
+    return {
+        "fvu": headline["fvu"],
+        "l0": headline["l0"],
+        "mse": headline["mse"],
+        "fvu_denominator": headline["fvu_denominator"],
+        "tokens": headline["tokens"],
+        "stability": snapshots,
+    }
+
+
+def _finalize_perf_result(
+    measure_perf: bool, perf_headline, perf_acc: dict,
+    headline_target: int, name: str, precision: str,
+):
+    """Reduce the cross-entropy accumulators into the result (or a status string)."""
+    if not measure_perf:
+        return None
+    if perf_acc["n_tokens"] == 0:
+        print(f"  [!] No performance tokens streamed for {name} @ {precision}.")
+        return "NO-DATA"
+    result = perf_headline
+    if result is None:
+        # Stream ran dry before the headline target; report at what we got.
+        result = finalize_cross_entropy(perf_acc["sum_nll"], perf_acc["n_tokens"])
+        print(f"  [!] Perf stream reached only {perf_acc['n_tokens']} predicted "
+              f"tokens (< headline {headline_target}); reporting at that count.")
+    print(f"  --- performance @ {result['tokens']} predicted tokens ---")
+    print(f"  cross-entropy (nats/tok):   {result['cross_entropy']:.4f}")
+    print(f"  perplexity:                 {result['perplexity']:.3f}")
+    return result
+
+
+def run_condition(
+    loaded_sae,
+    name: str,
+    precision: str,
+    layer: int,
+    dataset,
+    measure_sae: bool,
+    measure_perf: bool,
+) -> dict:
     """Run one (model x bit-width) condition over the streamed corpus.
 
-    Loads `name` at `precision`, then streams the Pile `dataset` packed into
-    fixed-length token chunks, capturing the residual stream at `layer` and
-    accumulating reconstruction SUMS one chunk at a time with the ALREADY-LOADED
-    `loaded_sae` (the fixed instrument — never reloaded or varied per bit-width).
+    A SINGLE forward pass per chunk serves both enabled measurements — there is no
+    separate forward for performance:
+      * SAE reconstruction FVU/L0 (when `measure_sae`): accumulated as a ratio of
+        SUMS (numerator = total squared error, denominator = total variance sum),
+        divided ONCE at the end; FVU/L0 snapshotted at each stability checkpoint.
+      * Model performance (when `measure_perf`): next-token cross-entropy read from
+        the SAME forward's output logits, accumulated TOKEN-WEIGHTED (total nll /
+        total predicted tokens), divided ONCE at the end.
 
-    FVU is accumulated as a ratio of sums (numerator = total squared error,
-    denominator = total variance sum) and divided ONCE at the end — averaging
-    per-chunk FVUs would be statistically wrong. Each activation chunk is freed
-    immediately after its sums are accumulated, so memory stays flat regardless
-    of how many tokens are processed.
+    The forward runs whenever EITHER measurement is enabled, so performance works
+    even with `measure_sae` False — it is never gated behind the SAE. A d_in
+    mismatch disables only the SAE half; performance still completes. Each chunk's
+    activations and logits are freed right after their sums are accumulated, so
+    memory stays flat regardless of token count.
 
-    Snapshots FVU/L0/MSE at each STABILITY_CHECKPOINTS token count (those within
-    the MAX_TOKENS budget) so the metric can be watched stabilizing; processes up
-    to the largest such checkpoint. On success returns the HEADLINE metrics dict
-    (at N_TOKENS) plus a `stability` list of per-checkpoint snapshots. On a
-    non-fatal skip returns a distinct STATUS STRING instead: "MISMATCH" (model
-    d_model != SAE d_in) or "NO-DATA" (the stream yielded no tokens). The model is
-    always freed in the finally block; OOM/other exceptions propagate after cleanup.
+    Returns {"sae": <result>, "performance": <result>} where each <result> is a
+    metrics dict, a status string ("MISMATCH" / "NO-DATA"), or None if that
+    measurement was disabled. The model is always freed in the finally block;
+    OOM/other exceptions propagate after cleanup.
     """
     loaded = None
     try:
@@ -246,18 +321,22 @@ def run_condition(loaded_sae, name: str, precision: str, layer: int, dataset) ->
         loaded = load_model(name, precision=precision, compute_dtype=torch.bfloat16)
         print("      done.")
 
-        d_in = loaded_sae.sae.cfg.d_in
+        d_in = loaded_sae.sae.cfg.d_in if measure_sae else None
         checkpoints = _active_checkpoints()  # honors the MAX_TOKENS budget
-        target_tokens = min(MAX_TOKENS, checkpoints[-1]) if checkpoints else MAX_TOKENS
+        headline_target = _headline_target()
+        # SAE needs the full stability sweep (up to the largest checkpoint);
+        # performance only needs the headline budget. Stream to whichever the
+        # enabled measurements require.
+        sae_target = min(MAX_TOKENS, checkpoints[-1])
+        target_tokens = sae_target if measure_sae else headline_target
 
         print(
-            f"[2/2] Streaming residual stream at layer {layer} in "
-            f"{BATCH_SIZE}x{CHUNK_LEN}-token chunks up to {target_tokens} tokens..."
+            f"[2/2] Streaming layer {layer} in {BATCH_SIZE}x{CHUNK_LEN}-token chunks "
+            f"up to {target_tokens} tokens  (SAE={measure_sae}, perf={measure_perf})..."
         )
 
-        # Accumulators (kept as the numerator/denominator building blocks; we
-        # NEVER average per-chunk FVUs). All reduced in float64 inside the chunk
-        # helper, then summed here.
+        # SAE accumulators (numerator/denominator blocks; never average per-chunk
+        # FVUs). All reduced in float64 inside the chunk helper, summed here.
         acc = {
             "sse": 0.0,
             "sum_x": 0.0,
@@ -268,85 +347,85 @@ def run_condition(loaded_sae, name: str, precision: str, layer: int, dataset) ->
         }
         snapshots: list[dict] = []
         next_ckpt = 0  # index into `checkpoints` of the next milestone to record
-        verified = False
+        sae_active = measure_sae
+        sae_status = None       # set to "MISMATCH" if the d_in check fails
+        checked_d_in = False
+
+        # Performance accumulators (token-weighted nll). `perf_headline` is the
+        # snapshot taken when cumulative input tokens reach the headline target.
+        perf_acc = {"sum_nll": 0.0, "n_tokens": 0}
+        perf_headline = None
+        total_input_tokens = 0
 
         batches = iter_token_batches(
             loaded.tokenizer, dataset, CHUNK_LEN, BATCH_SIZE, target_tokens
         )
         for input_ids in batches:
-            acts = capture_resid_from_input_ids(loaded, input_ids, layer)
+            if measure_perf:
+                acts, logits = capture_resid_from_input_ids(
+                    loaded, input_ids, layer, return_logits=True
+                )
+            else:
+                acts = capture_resid_from_input_ids(loaded, input_ids, layer)
+                logits = None
+            total_input_tokens += int(input_ids.numel())
 
-            # d_in sanity check on the first chunk: a mismatch is the silent-
-            # wrong-answer trap. Skip the whole condition rather than reporting a
-            # meaningless FVU.
-            if not verified:
+            # SAE d_in sanity check on the first chunk: a mismatch means the SAE
+            # can't be applied — skip the SAE half, but DO NOT abort performance.
+            if sae_active and not checked_d_in:
                 d_model = acts.shape[-1]
                 match = d_model == d_in
                 print(f"      first chunk shape: {tuple(input_ids.shape)} -> "
                       f"resid {tuple(acts.shape)} (d_model={d_model})")
                 print(f"      SAE sae_id={loaded_sae.sae_id}  d_in={d_in}  match={match}")
                 if not match:
-                    print(
-                        f"  [!] MISMATCH: model d_model={d_model} != SAE d_in={d_in}. "
-                        f"Skipping {name} @ {precision}."
-                    )
-                    del acts
-                    return "MISMATCH"
-                verified = True
+                    print(f"  [!] MISMATCH: model d_model={d_model} != SAE d_in={d_in}. "
+                          f"Skipping SAE for {name} @ {precision}.")
+                    sae_active = False
+                    sae_status = "MISMATCH"
+                checked_d_in = True
 
-            # Accumulate this chunk's sums, then FREE the activation chunk — the
-            # per-chunk activations are the memory risk now, not the model.
-            sums = encode_decode_sums(loaded_sae.sae, acts)
+            # SAE: accumulate this chunk's sums.
+            if sae_active:
+                sums = encode_decode_sums(loaded_sae.sae, acts)
+                for key in acc:
+                    acc[key] += sums[key]
             del acts
-            for key in acc:
-                acc[key] += sums[key]
 
-            # Record a stability snapshot each time we cross a checkpoint.
-            while next_ckpt < len(checkpoints) and acc["n_tokens"] >= checkpoints[next_ckpt]:
-                snap = _metrics_from_sums(acc)
-                snap["target"] = checkpoints[next_ckpt]
-                snapshots.append(snap)
-                print(
-                    f"      ~{checkpoints[next_ckpt]:>6} tok (actual {snap['tokens']:>6}): "
-                    f"FVU={snap['fvu']:.4f}  L0={snap['l0']:.1f}"
-                )
-                next_ckpt += 1
-            if next_ckpt >= len(checkpoints):
+            # Performance: accumulate token-weighted nll from the SAME forward.
+            if measure_perf:
+                ce = cross_entropy_sums(logits, input_ids)
+                del logits
+                perf_acc["sum_nll"] += ce["sum_nll"]
+                perf_acc["n_tokens"] += ce["n_tokens"]
+                if perf_headline is None and total_input_tokens >= headline_target:
+                    perf_headline = finalize_cross_entropy(
+                        perf_acc["sum_nll"], perf_acc["n_tokens"]
+                    )
+
+            # SAE stability snapshots at each crossed checkpoint.
+            if sae_active:
+                while next_ckpt < len(checkpoints) and acc["n_tokens"] >= checkpoints[next_ckpt]:
+                    snap = _metrics_from_sums(acc)
+                    snap["target"] = checkpoints[next_ckpt]
+                    snapshots.append(snap)
+                    print(f"      ~{checkpoints[next_ckpt]:>6} tok (actual {snap['tokens']:>6}): "
+                          f"FVU={snap['fvu']:.4f}  L0={snap['l0']:.1f}")
+                    next_ckpt += 1
+
+            # Stop once every enabled measurement has what it needs.
+            sae_done = (not sae_active) or (next_ckpt >= len(checkpoints))
+            perf_done = (not measure_perf) or (perf_headline is not None)
+            if sae_done and perf_done:
                 break
 
-        if acc["n_tokens"] == 0:
-            print(f"  [!] No tokens streamed for {name} @ {precision}.")
-            return "NO-DATA"
-
-        # Headline = the snapshot at the headline target (N_TOKENS capped to the
-        # budget). It is one of `checkpoints`, so it is normally recorded during
-        # the loop above. If the stream ran dry before reaching it, fall back to
-        # the metrics at the most tokens we actually got — never assume a snapshot
-        # exists (snapshots can be empty for a tiny budget / short stream).
-        headline_target = _headline_target()
-        headline = next(
-            (s for s in snapshots if s["target"] == headline_target), None
-        )
-        if headline is None:
-            headline = _metrics_from_sums(acc)
-            headline["target"] = headline_target
-            print(
-                f"  [!] Stream reached only {acc['n_tokens']} tokens "
-                f"(< headline target {headline_target}); reporting at that count."
-            )
-        print(f"  --- headline @ {headline['tokens']} tokens ---")
-        print(f"  tokens evaluated:           {headline['tokens']}")
-        print(f"  reconstruction MSE:         {headline['mse']:.6f}")
-        print(f"  FVU denominator (var sum):  {headline['fvu_denominator']:.4f}")
-        print(f"  FVU (1 - R^2):              {headline['fvu']:.4f}")
-        print(f"  mean L0 (active feats):     {headline['l0']:.1f}")
         return {
-            "fvu": headline["fvu"],
-            "l0": headline["l0"],
-            "mse": headline["mse"],
-            "fvu_denominator": headline["fvu_denominator"],
-            "tokens": headline["tokens"],
-            "stability": snapshots,
+            "sae": _finalize_sae_result(
+                measure_sae, sae_status, snapshots, acc, headline_target, name, precision
+            ),
+            "performance": _finalize_perf_result(
+                measure_perf, perf_headline, perf_acc, headline_target, name, precision
+            ),
         }
     finally:
         # Free GPU memory between EVERY condition — each bit-width is a fresh
@@ -399,9 +478,12 @@ def main() -> None:
     print(f"  sample:    headline N_TOKENS={N_TOKENS}  MAX_TOKENS={MAX_TOKENS}")
     print(f"  stability: {', '.join(str(c) for c in _active_checkpoints())}"
           + (f"  (checkpoints > MAX_TOKENS skipped)" if _active_checkpoints() != list(STABILITY_CHECKPOINTS) else ""))
-    print(f"  measure:   SAE={MEASURE_SAE}  NOISE_FLOOR={MEASURE_NOISE_FLOOR}")
+    print(f"  measure:   SAE={MEASURE_SAE}  NOISE_FLOOR={MEASURE_NOISE_FLOOR}  "
+          f"MODEL_PERFORMANCE={MEASURE_MODEL_PERFORMANCE}")
     print("=" * 70)
 
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    gpu_name = None
     if not torch.cuda.is_available():
         print(
             "\n[!] No CUDA GPU visible (torch.cuda.is_available() is False).\n"
@@ -440,8 +522,10 @@ def main() -> None:
 
     # results[name][precision]       -> SAE FVU metrics dict / status string.
     # noise_results[name][precision] -> perturbation metrics dict / status string.
+    # perf_results[name][precision]  -> cross-entropy metrics dict / status string.
     results: dict[str, dict[str, object]] = {}
     noise_results: dict[str, dict[str, object]] = {}
+    perf_results: dict[str, dict[str, object]] = {}
 
     for model_cfg in MODEL_CONFIGS:
         name = model_cfg["model_name"]
@@ -450,15 +534,18 @@ def main() -> None:
         available_layers = tuple(model_cfg["available_layers"])
         results.setdefault(name, {})
         noise_results.setdefault(name, {})
+        perf_results.setdefault(name, {})
 
         print("\n" + "=" * 70)
         print(f"MODEL: {name}  (layer {layer})")
         print("=" * 70)
 
         # Load the SAE ONCE per model and reuse it across all its bit-widths. The
-        # SAE is loaded in ALL modes (the noise-floor control also needs it for
-        # the reconstruction-residual comparison), never gated on MEASURE_SAE.
+        # SAE is loaded whenever it could be needed (SAE measurement or the
+        # noise-floor control); a load failure disables only those — performance
+        # does NOT depend on the SAE and still runs.
         loaded_sae = None
+        sae_load_failed = False
         try:
             print(f"Loading Gemma Scope 2 residual SAE (once for all bit-widths)...")
             loaded_sae = load_residual_sae(
@@ -475,38 +562,55 @@ def main() -> None:
             )
         except Exception as exc:  # noqa: BLE001
             print(f"  FAILED to load SAE for {name}: {type(exc).__name__}: {exc}")
-            for precision in DISPLAY_BITWIDTHS:
-                results[name][precision] = "SAE-FAIL"
-                noise_results[name][precision] = "SAE-FAIL"
-            continue
+            sae_load_failed = True
+            if MEASURE_SAE:
+                for precision in DISPLAY_BITWIDTHS:
+                    results[name][precision] = "SAE-FAIL"
+            if MEASURE_NOISE_FLOOR:
+                for precision in ("8bit", "4bit"):
+                    noise_results[name][precision] = "SAE-FAIL"
+
+        # SAE measurement only runs if the SAE actually loaded.
+        eff_measure_sae = MEASURE_SAE and not sae_load_failed
 
         try:
-            # --- Measurement 1: SAE reconstruction FVU/L0 (existing path) ----
-            if MEASURE_SAE:
+            # --- Forward-based measurements: SAE recon + model performance ----
+            # ONE forward per chunk serves both. Runs if either is enabled; the
+            # forward (and performance) is never gated behind the SAE.
+            if eff_measure_sae or MEASURE_MODEL_PERFORMANCE:
                 for precision in model_cfg["run_bitwidths"]:
-                    print(f"\n--- [SAE] {name} @ {precision} ---")
+                    print(f"\n--- [FWD] {name} @ {precision} ---")
                     try:
-                        # run_condition returns a metrics dict on success, or a
-                        # distinct status string ("MISMATCH" / "NO-DATA") on skip.
-                        results[name][precision] = run_condition(
-                            loaded_sae, name, precision, layer, dataset
+                        res = run_condition(
+                            loaded_sae, name, precision, layer, dataset,
+                            measure_sae=eff_measure_sae,
+                            measure_perf=MEASURE_MODEL_PERFORMANCE,
                         )
+                        if eff_measure_sae:
+                            results[name][precision] = res["sae"]
+                        if MEASURE_MODEL_PERFORMANCE:
+                            perf_results[name][precision] = res["performance"]
                     except Exception as exc:  # noqa: BLE001 — keep the matrix alive
+                        status = "N/A (OOM)" if _is_oom(exc) else "FAIL"
                         if _is_oom(exc):
                             print(f"\n  SKIPPED (out of memory): {name} @ {precision}")
-                            results[name][precision] = "N/A (OOM)"
                         else:
                             print(f"\n  FAILED: {type(exc).__name__}: {exc}")
-                            results[name][precision] = "FAIL"
+                        if eff_measure_sae:
+                            results[name][precision] = status
+                        if MEASURE_MODEL_PERFORMANCE:
+                            perf_results[name][precision] = status
                         gc.collect()
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
+                # Deltas vs each model's bf16 reference (bf16 ran first).
+                if MEASURE_MODEL_PERFORMANCE:
+                    _fill_perf_deltas(perf_results[name])
 
-            # --- Measurement 2: noise-floor / activation perturbation -------
-            # Separable layer: only runs when enabled, and is NOT woven into the
-            # FVU path above. bf16 is the reference; each quantized model is
-            # compared against it on the SAME deterministic tokens.
-            if MEASURE_NOISE_FLOOR:
+            # --- Noise-floor / activation perturbation (needs the SAE) -------
+            # Separable layer: only runs when enabled and the SAE loaded. bf16 is
+            # the reference; each quantized model is compared on the SAME tokens.
+            if MEASURE_NOISE_FLOOR and not sae_load_failed:
                 _run_noise_floor(loaded_sae, name, layer, dataset, noise_results[name])
         finally:
             # Free the SAE when moving to the next model.
@@ -515,12 +619,70 @@ def main() -> None:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+    # --- Console summaries (additive; unchanged when a measurement is off) ---
     if MEASURE_SAE:
         _print_stability_tables(results)
         _print_gradient_tables(results)
     if MEASURE_NOISE_FLOOR:
         _print_noise_floor_tables(noise_results)
+    if MEASURE_MODEL_PERFORMANCE:
+        _print_performance_tables(perf_results)
+
+    # --- Persist all enabled measurements to disk (additive) -----------------
+    metadata = {
+        "timestamp": timestamp,
+        "models": [m["model_name"] for m in MODEL_CONFIGS],
+        "bit_widths": list(DISPLAY_BITWIDTHS),
+        "n_tokens": N_TOKENS,
+        "max_tokens": MAX_TOKENS,
+        "headline_target": _headline_target(),
+        "shuffle_seed": shuffle_seed,
+        "shuffle_buffer": SHUFFLE_BUFFER,
+        "dataset": dataset_source,
+        "gpu": gpu_name,
+        "measurements": {
+            "sae": MEASURE_SAE,
+            "noise_floor": MEASURE_NOISE_FLOOR,
+            "model_performance": MEASURE_MODEL_PERFORMANCE,
+        },
+    }
+    document = build_results_document(
+        metadata,
+        results if MEASURE_SAE else None,
+        noise_results if MEASURE_NOISE_FLOOR else None,
+        perf_results if MEASURE_MODEL_PERFORMANCE else None,
+        MODEL_CONFIGS,
+        DISPLAY_BITWIDTHS,
+    )
+    run_path, latest_path = write_results(document, timestamp)
+    print(f"\nResults written to:\n  {run_path}\n  {latest_path}")
+
     print("\nExperiment complete.")
+
+
+def _fill_perf_deltas(perf_by_bitwidth: dict) -> None:
+    """Fill delta-vs-bf16 fields on each performance record (in place).
+
+    bf16 is the reference precision: its delta is 0.0; each quantized condition's
+    delta is its cross-entropy minus the bf16 cross-entropy (absolute and percent).
+    Records that are status strings, or any condition when bf16 is unavailable, get
+    None deltas.
+    """
+    bf16 = perf_by_bitwidth.get("bf16")
+    base_ce = bf16["cross_entropy"] if isinstance(bf16, dict) else None
+    for bw, entry in perf_by_bitwidth.items():
+        if not isinstance(entry, dict):
+            continue
+        if bw == "bf16":
+            entry["delta_vs_bf16_abs"] = 0.0
+            entry["delta_vs_bf16_pct"] = 0.0
+        elif base_ce is None:
+            entry["delta_vs_bf16_abs"] = None
+            entry["delta_vs_bf16_pct"] = None
+        else:
+            delta = entry["cross_entropy"] - base_ce
+            entry["delta_vs_bf16_abs"] = delta
+            entry["delta_vs_bf16_pct"] = delta / base_ce * 100.0
 
 
 def _run_noise_floor(loaded_sae, name: str, layer: int, dataset, out: dict) -> None:
@@ -741,6 +903,72 @@ def _print_noise_floor_tables(noise_results: dict) -> None:
                     f"(ratio {min_ratio:.2f}-{max_ratio:.2f}) -> interpret with care"
                 )
             print(f"  => {verdict}")
+
+
+def _print_performance_tables(perf_results: dict) -> None:
+    """Print model-performance tables: cross-entropy, perplexity, and delta vs bf16.
+
+    Cross-entropy is the token-weighted mean (total nll / total predicted tokens);
+    perplexity = exp(cross_entropy). The delta-vs-bf16 table is the interpretable
+    quantity: how much compression raised the model's loss (absolute nats and %).
+    """
+    quant_bitwidths = ("8bit", "4bit")
+
+    print("\n" + "=" * 70)
+    print("MODEL PERFORMANCE — cross-entropy / perplexity (lower = better)")
+    print("=" * 70)
+
+    def _metric_cell(entry: object, key: str, fmt: str) -> str:
+        if isinstance(entry, dict):
+            value = entry.get(key)
+            return format(value, fmt) if value is not None else "-"
+        return "-" if entry is None else str(entry)
+
+    col_w = 12
+    header = "  {:<16}".format("model") + "".join(
+        "{:>{w}}".format(bw, w=col_w) for bw in DISPLAY_BITWIDTHS
+    )
+
+    print("\ncross-entropy (nats/token) by (model x bit-width)")
+    print(header)
+    for model_cfg in MODEL_CONFIGS:
+        name = model_cfg["model_name"]
+        row = "  {:<16}".format(name.replace("google/", ""))
+        for bw in DISPLAY_BITWIDTHS:
+            row += "{:>{w}}".format(
+                _metric_cell(perf_results.get(name, {}).get(bw), "cross_entropy", ".4f"), w=col_w
+            )
+        print(row)
+
+    print("\nperplexity by (model x bit-width)")
+    print(header)
+    for model_cfg in MODEL_CONFIGS:
+        name = model_cfg["model_name"]
+        row = "  {:<16}".format(name.replace("google/", ""))
+        for bw in DISPLAY_BITWIDTHS:
+            row += "{:>{w}}".format(
+                _metric_cell(perf_results.get(name, {}).get(bw), "perplexity", ".3f"), w=col_w
+            )
+        print(row)
+
+    print("\ndelta vs bf16 — cross-entropy rise under compression (abs nats / %)")
+    dheader = "  {:<16}".format("model") + "".join(
+        "{:>{w}}".format(bw, w=col_w) for bw in quant_bitwidths
+    )
+    print(dheader)
+    for model_cfg in MODEL_CONFIGS:
+        name = model_cfg["model_name"]
+        row = "  {:<16}".format(name.replace("google/", ""))
+        for bw in quant_bitwidths:
+            entry = perf_results.get(name, {}).get(bw)
+            if isinstance(entry, dict) and entry.get("delta_vs_bf16_abs") is not None:
+                cell = f"{entry['delta_vs_bf16_abs']:+.4f}/{entry['delta_vs_bf16_pct']:+.2f}%"
+            elif isinstance(entry, dict):
+                cell = "n/a"  # no bf16 reference for this model
+            else:
+                cell = "-" if entry is None else str(entry)
+            row += "{:>{w}}".format(cell, w=col_w + 6)
+        print(row)
 
 
 if __name__ == "__main__":
