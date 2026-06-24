@@ -2,7 +2,7 @@
 """Standalone feasibility smoke test, across multiple Gemma 3 model sizes.
 
 End-to-end check that the pieces fit together, run once per model in
-MODEL_CONFIGS (4B baseline, 12B, 27B):
+MODEL_CONFIGS (4B baseline, 12B):
   1. Load the model in 4-bit.
   2. Run a batch of text and capture the residual stream at a middle layer.
   3. Load the matching Gemma Scope 2 residual-stream SAE for that layer (SAELens).
@@ -18,7 +18,6 @@ The SAE release strings and per-model available layers below were resolved from
 the SAELens pretrained-SAE registry (get_pretrained_saes_directory), NOT guessed:
   - 4B  gemma-scope-2-4b-pt-res   layers 9, 17, 22, 29   -> layer 17
   - 12B gemma-scope-2-12b-pt-res  layers 12, 24, 31, 41  -> layer 24
-  - 27B gemma-scope-2-27b-pt-res  layers 16, 31, 40, 53  -> layer 31
 All use width=16k, l0=medium so reconstruction numbers are comparable.
 """
 
@@ -50,9 +49,8 @@ DISPLAY_BITWIDTHS = ("bf16", "8bit", "4bit")
 # chosen FROM that set (not n_layers/2). See module docstring for provenance.
 #
 # `run_bitwidths` is the order conditions are *executed* in for that model. For
-# 4B/12B all three fit a 40GB A100 in any order. For 27B we run the two that fit
-# first (4bit ~14GB, 8bit ~27GB) and put bf16 (~54GB, expected OOM on 40GB) LAST,
-# so the one expected failure is the final condition of the whole run.
+# both 4B and 12B all three bit-widths fit a 40GB A100 in any order, so every
+# condition in the matrix is expected to produce numbers.
 MODEL_CONFIGS = [
     {
         "model_name": "google/gemma-3-4b-pt",  # known-good baseline
@@ -67,14 +65,6 @@ MODEL_CONFIGS = [
         "available_layers": (12, 24, 31, 41),
         "layer": 24,
         "run_bitwidths": ("bf16", "8bit", "4bit"),
-    },
-    {
-        "model_name": "google/gemma-3-27b-pt",
-        "sae_release": "gemma-scope-2-27b-pt-res",
-        "available_layers": (16, 31, 40, 53),
-        "layer": 31,
-        # bf16 last: 27B bf16 (~54GB) is the expected OOM on a 40GB A100.
-        "run_bitwidths": ("4bit", "8bit", "bf16"),
     },
 ]
 
@@ -208,16 +198,16 @@ def main() -> None:
     else:
         gpu_name = torch.cuda.get_device_name(0)
         print(f"\nGPU: {gpu_name}")
-        # The matrix is sized for a 40GB A100: everything fits EXCEPT 27B bf16
-        # (~54GB), which is the documented hardware ceiling and OOM-skips. On a
-        # smaller GPU, bf16 12B (~24GB) and all 27B conditions will likely OOM.
+        # The matrix is sized for a 40GB A100: all 6 conditions fit, the largest
+        # single load being 12B bf16 (~24GB). On a smaller GPU (e.g. a T4),
+        # 12B bf16 will likely OOM.
         large_gpu = any(
             tag in gpu_name for tag in ("A100", "H100", "H200", "A6000", "L40", "80GB")
         )
         if not large_gpu:
             print(
                 "[!] This does not look like an A100/large GPU. Expect OOM on\n"
-                "    bf16 12B (~24GB) and all 27B conditions. Smaller conditions\n"
+                "    bf16 12B (~24GB), which needs a large GPU. Smaller conditions\n"
                 "    (4B all precisions, 12B 8bit/4bit) should still report.\n"
                 "    On Colab Pro+: Runtime -> Change runtime type -> A100."
             )
@@ -267,8 +257,6 @@ def main() -> None:
                 except Exception as exc:  # noqa: BLE001 — keep the matrix alive
                     if _is_oom(exc):
                         print(f"\n  SKIPPED (out of memory): {name} @ {precision}")
-                        if "27b" in name and precision == "bf16":
-                            print("      (expected: 27B bf16 ~54GB > 40GB A100)")
                         results[name][precision] = "N/A (OOM)"
                     else:
                         print(f"\n  FAILED: {type(exc).__name__}: {exc}")
