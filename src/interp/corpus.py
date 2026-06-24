@@ -22,7 +22,10 @@ PILE_PRIMARY = "NeelNanda/pile-10k"
 PILE_FALLBACK = "monology/pile-uncopyrighted"
 
 
-def load_pile_stream() -> tuple[object, str]:
+def load_pile_stream(
+    shuffle_seed: int | None = None,
+    shuffle_buffer: int = 10_000,
+) -> tuple[object, str]:
     """Open a streamed Pile dataset; return (dataset, source_name).
 
     Tries `NeelNanda/pile-10k` first and validates it is reachable by peeking at
@@ -30,16 +33,27 @@ def load_pile_stream() -> tuple[object, str]:
     the peek consumes nothing). Falls back to `monology/pile-uncopyrighted` on
     any failure. `datasets` is imported lazily so importing this module stays
     cheap and does not require the package until a run actually streams data.
+
+    If `shuffle_seed` is not None, the streaming iterable is shuffled with that
+    FIXED seed and a `shuffle_buffer`-sized reservoir. This averages token
+    difficulty over the corpus rather than reading it in raw stream order, while
+    staying deterministic — re-iterating yields the SAME order every time, so
+    every (model x bit-width) condition sees identical tokens (required for the
+    noise-floor per-token comparison).
     """
     from datasets import load_dataset
 
     try:
         ds = load_dataset(PILE_PRIMARY, split="train", streaming=True)
         _ = next(iter(ds))  # validate the stream is actually reachable
-        return ds, PILE_PRIMARY
+        source = PILE_PRIMARY
     except Exception:  # noqa: BLE001 — any failure means fall back
         ds = load_dataset(PILE_FALLBACK, split="train", streaming=True)
-        return ds, PILE_FALLBACK
+        source = PILE_FALLBACK
+
+    if shuffle_seed is not None:
+        ds = ds.shuffle(seed=shuffle_seed, buffer_size=shuffle_buffer)
+    return ds, source
 
 
 def iter_token_batches(
